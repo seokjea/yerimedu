@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+venv/
+reading_review_env/
+*.log
+.DS_Store

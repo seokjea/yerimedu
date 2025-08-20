@@ -65,7 +65,7 @@ def call_openai_api(messages, max_tokens=500, temperature=0.7):
         response = client.chat.completions.create(
             model="gpt-5",
             messages=messages,
-            max_tokens=max_tokens,
+            max_completion_tokens=max_tokens,
             temperature=temperature
         )
         return response.choices[0].message.content

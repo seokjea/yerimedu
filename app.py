@@ -33,8 +33,12 @@ def log_event(kind, payload=None):
 def init_state():
     for k, v in {
         "book_title": "",
+        "book_title_input": "",
         "book_text": "",
         "outline": {"intro": "", "body": "", "concl": ""},
+        "outline_intro": "",
+        "outline_body": "",
+        "outline_concl": "",
         "draft": "",
         "suggestions": [],
         "events": [],
@@ -43,9 +47,14 @@ def init_state():
         "enable_questions": True,
         "role": "학생",
         "selected_book": "",
-        "ai_suggestions_cache": {},  # AI 제안 캐시
+        "ai_suggestions_cache": {},
         "current_questions": [],
-        "use_chat_mode": True,  # ← Enter로 전송되는 채팅 입력 모드 기본값
+        "use_chat_mode": True,  # 초안 입력은 Enter 전송 채팅 방식
+        # 각 영역 직접 편집 토글
+        "edit_book_text": False,
+        "edit_outline_intro": False,
+        "edit_outline_body": False,
+        "edit_outline_concl": False,
     }.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -70,9 +79,8 @@ def call_openai_api(messages, max_tokens=500):
 
 
 def generate_ai_suggestions(context, block, n=3):
-    """AI를 활용한 작문 제안 생성"""
+    """AI를 활용한 작문 제안 생성 (Enter 기반 입력 흐름과 무관)"""
 
-    # 캐시 키 생성 (필요 필드만 묶어서 안정적인 키 생성)
     key_fields = (
         context.get("book_title", ""),
         context.get("book_text", "")[:500],
@@ -85,7 +93,6 @@ def generate_ai_suggestions(context, block, n=3):
     if cache_key in st.session_state["ai_suggestions_cache"]:
         return st.session_state["ai_suggestions_cache"][cache_key]
 
-    # 블록별 프롬프트 설정
     block_prompts = {
         "intro": "독서감상문의 서론 부분으로, 책을 읽게 된 계기나 첫인상에 대한",
         "body": "독서감상문의 본론 부분으로, 인상 깊은 장면과 느낀 점에 대한",
@@ -124,30 +131,20 @@ def generate_ai_suggestions(context, block, n=3):
         response = call_openai_api(messages, max_tokens=400)
 
     if response:
-        # 응답을 줄 단위로 분리하고 정리
         suggestions = []
         for line in response.strip().split("\n"):
-            line = line.strip()
-            # 번호나 특수문자 제거
-            line = line.lstrip("0123456789.- ")
-            if line and len(line) > 10:  # 너무 짧은 건 제외
+            line = line.strip().lstrip("0123456789.- ")
+            if line and len(line) > 10:
                 suggestions.append(line)
-
-        # 요청된 개수만큼만 반환
         suggestions = suggestions[:n]
-
-        # 캐시에 저장
         st.session_state["ai_suggestions_cache"][cache_key] = suggestions
-
         log_event("ai_suggestions_generated", {"block": block, "count": len(suggestions)})
         return suggestions
 
-    # API 실패 시 기본 제안 반환
     return get_fallback_suggestions(block, n)
 
 
 def get_fallback_suggestions(block, n=3):
-    """AI API 실패 시 기본 제안"""
     fallback = {
         "intro": [
             "이 책을 읽게 된 이유는 친구가 재미있다고 추천해주었기 때문입니다.",
@@ -169,7 +166,6 @@ def get_fallback_suggestions(block, n=3):
 
 
 def generate_guiding_questions(context):
-    """상황에 맞는 유도 질문 생성"""
     prompt = f"""
 초등학생이 독서감상문을 쓸 때 도움이 되는 생각 유도 질문을 3개 만들어주세요.
 
@@ -193,7 +189,6 @@ def generate_guiding_questions(context):
         questions = [q.strip().lstrip("0123456789.- ") for q in response.split("\n") if q.strip()]
         return questions[:3]
 
-    # 기본 질문 반환
     return [
         "주인공의 행동에 대해 어떻게 생각하나요?",
         "이 책에서 가장 중요한 메시지는 무엇인가요?",
@@ -202,7 +197,6 @@ def generate_guiding_questions(context):
 
 
 def check_spelling_and_grammar(text):
-    """맞춤법 및 문법 검사 (간단한 피드백)"""
     if not text.strip():
         return []
 
@@ -229,7 +223,7 @@ def check_spelling_and_grammar(text):
 
 
 # ---------------------------
-# 워드 파일에서 언급된 추천 도서들
+# 추천 도서 데이터
 # ---------------------------
 RECOMMENDED_BOOKS = {
     "소리없는 아이들 - 황선미": {
@@ -268,7 +262,40 @@ RECOMMENDED_BOOKS = {
 
 
 # ---------------------------
-# 3) UI 개선
+# 공통 컴포넌트: Enter로 전송되는 입력 폼
+# ---------------------------
+
+def enter_append_form(label: str, value_key: str, preview_height: int = 120, edit_toggle_key: str | None = None):
+    """
+    - 현재 값 미리보기 (기본 읽기 전용)
+    - 한 줄 입력 + Enter로 전송(Form): 입력 즉시 누적
+    - 필요 시 '직접 편집' 토글로 text_area 활성화
+    """
+    st.markdown(f"**{label}**")
+
+    # 직접 편집 토글
+    editable = False
+    if edit_toggle_key:
+        editable = st.checkbox("✎ 직접 편집(텍스트 영역)", key=edit_toggle_key)
+
+    if editable:
+        st.text_area("", key=value_key, height=preview_height)
+    else:
+        st.text_area("", value=st.session_state.get(value_key, ""), height=preview_height, disabled=True)
+
+        # Enter 전송 폼
+        with st.form(key=f"{value_key}_form", clear_on_submit=True):
+            new_line = st.text_input("Enter로 추가 (한 줄)", key=f"{value_key}_input", placeholder="여기에 입력하고 Enter")
+            submitted = st.form_submit_button("추가")
+            if submitted and new_line and new_line.strip():
+                prev = st.session_state.get(value_key, "").strip()
+                st.session_state[value_key] = (prev + ("\n" if prev else "") + new_line.strip())
+                log_event("enter_append", {"field": value_key, "chars": len(new_line.strip())})
+                st.rerun()
+
+
+# ---------------------------
+# 3) 사이드바 (책 제목도 Enter로 반영)
 # ---------------------------
 
 def render_sidebar():
@@ -294,12 +321,19 @@ def render_sidebar():
         st.session_state["book_title"] = selected_book
         book_info = RECOMMENDED_BOOKS[selected_book]
         st.session_state["book_text"] = (
-            f"{book_info['summary']}\n\n주요 장면들:\n"
-            + "\n".join([f"- {scene}" for scene in book_info["key_scenes"]])
+            f"{book_info['summary']}\n\n주요 장면들:\n" + "\n".join([f"- {scene}" for scene in book_info["key_scenes"]])
         )
         st.sidebar.success(f"'{selected_book}' 정보가 로드되었습니다!")
     else:
-        st.session_state["book_title"] = st.sidebar.text_input("책 제목", st.session_state["book_title"])
+        # 책 제목: Enter로 반영되는 Form
+        with st.sidebar.form("book_title_form", clear_on_submit=False):
+            st.session_state["book_title_input"] = st.text_input(
+                "책 제목 (Enter로 반영)", st.session_state.get("book_title", "")
+            )
+            submitted = st.form_submit_button("적용")
+            if submitted:
+                st.session_state["book_title"] = st.session_state["book_title_input"].strip()
+
         uploaded = st.sidebar.file_uploader("책 요약/중요 부분(.txt)", type=["txt"])
         if uploaded:
             try:
@@ -323,10 +357,13 @@ def render_sidebar():
         )
 
 
+# ---------------------------
+# 4) 본문 UI
+# ---------------------------
+
 def render_quality_panel():
     if st.session_state["enable_hints"] and st.session_state["draft"].strip():
         st.markdown("**✍️ AI 맞춤법 및 표현 도움**")
-
         if st.button("🔍 맞춤법 검사하기"):
             with st.spinner("AI가 글을 검토하고 있어요..."):
                 feedback = check_spelling_and_grammar(st.session_state["draft"])
@@ -339,194 +376,37 @@ def render_quality_panel():
 
     if st.session_state["enable_questions"]:
         st.markdown("**🤔 AI가 제안하는 생각 질문**")
-
         if st.button("💡 새로운 질문 받기"):
-            context = {
-                "book_title": st.session_state["book_title"],
-                "draft": st.session_state["draft"],
-            }
+            context = {"book_title": st.session_state["book_title"], "draft": st.session_state["draft"]}
             with st.spinner("AI가 질문을 만들고 있어요..."):
                 questions = generate_guiding_questions(context)
                 st.session_state["current_questions"] = questions
-
-        # 현재 질문들 표시
         if st.session_state.get("current_questions"):
             for i, q in enumerate(st.session_state["current_questions"], 1):
                 st.write(f"{i}. {q}")
 
 
 def render_outline():
-    st.subheader("📖 Step 1. 책 내용 확인 및 정리")
+    st.subheader("📖 Step 1. 책 내용 확인 및 정리 (Enter로 추가)")
 
     if st.session_state["book_title"]:
         st.success(f"선택된 책: **{st.session_state['book_title']}**")
 
-    st.text_area(
-        "책 요약/중요 부분",
-        key="book_text",
-        height=120,
-        placeholder="책에서 중요한 장면이나 문장을 입력해주세요. 위에서 추천 도서를 선택하면 자동으로 채워집니다.",
-    )
+    # 책 요약: Enter로 줄 단위 추가 + 필요 시 직접 편집
+    enter_append_form("책 요약/중요 부분", "book_text", preview_height=140, edit_toggle_key="edit_book_text")
 
-    st.subheader("📝 Step 2. 글의 뼈대 만들기")
+    st.subheader("📝 Step 2. 글의 뼈대 만들기 (Enter로 추가)")
     cols = st.columns(3)
 
     with cols[0]:
-        st.markdown("**서론 (책 소개/읽게 된 이유)**")
-        st.text_area("", key="outline_intro", height=120, placeholder="• 책을 읽게 된 계기\n• 첫인상이나 기대\n• 간단한 책 소개")
+        enter_append_form("서론 (책 소개/읽게 된 이유)", "outline_intro", preview_height=140, edit_toggle_key="edit_outline_intro")
 
     with cols[1]:
-        st.markdown("**본론 (인상 깊은 장면/느낀 점)**")
-        st.text_area("", key="outline_body", height=120, placeholder="• 가장 기억에 남는 장면\n• 그 이유와 느낀 점\n• 나의 경험과 연결")
+        enter_append_form("본론 (인상 깊은 장면/느낀 점)", "outline_body", preview_height=140, edit_toggle_key="edit_outline_body")
 
     with cols[2]:
-        st.markdown("**결론 (배운 점/추천 이유)**")
-        st.text_area("", key="outline_concl", height=120, placeholder="• 책에서 배운 것\n• 추천하고 싶은 이유\n• 앞으로의 다짐")
+        enter_append_form("결론 (배운 점/추천 이유)", "outline_concl", preview_height=140, edit_toggle_key="edit_outline_concl")
 
-    # session dict 동기화
+    # outline dict 동기화
     st.session_state["outline"]["intro"] = st.session_state.get("outline_intro", "")
     st.session_state["outline"]["body"] = st.session_state.get("outline_body", "")
-    st.session_state["outline"]["concl"] = st.session_state.get("outline_concl", "")
-
-
-def render_suggestion_block(label, key_block, icon):
-    st.markdown(f"### {icon} {label} 작성 도움")
-
-    if st.button(f"🤖 AI {label} 제안 받기", key=f"generate_{key_block}"):
-        ctx = {
-            "book_title": st.session_state["book_title"],
-            "book_text": st.session_state["book_text"],  # ← 키 통일
-            "outline": st.session_state["outline"],
-            "draft": st.session_state["draft"],
-        }
-        suggestions = generate_ai_suggestions(ctx, key_block, st.session_state["n_sugs"])
-        st.session_state[f"suggestions_{key_block}"] = suggestions
-
-    # 각 블록별로 별도의 suggestions 저장
-    current_suggestions = st.session_state.get(f"suggestions_{key_block}", [])
-
-    if current_suggestions:
-        st.markdown("**🎯 AI가 만든 작문 제안들**")
-
-        for i, sug in enumerate(current_suggestions):
-            with st.container(border=True):
-                st.write(f"**제안 {i+1}:** {sug}")
-                c1, c2, c3 = st.columns([1, 1, 2])
-                with c1:
-                    if st.button(f"✅ 선택", key=f"accept_{key_block}_{i}"):
-                        current_draft = st.session_state["draft"].strip()
-                        addition = f"\n\n{sug}" if current_draft else sug
-                        st.session_state["draft"] = (current_draft + addition) if current_draft else addition
-                        log_event("ai_suggestion_accepted", {"block": key_block, "text": sug})
-                        st.success("본문에 추가했어요!")
-                        time.sleep(0.5)
-                        st.rerun()
-
-                with c2:
-                    if st.button(f"❌ 패스", key=f"reject_{key_block}_{i}"):
-                        log_event("ai_suggestion_rejected", {"block": key_block, "text": sug})
-                        st.info("다른 제안을 확인해보세요!")
-
-
-# 핵심 변경: Enter로 전송되는 채팅 입력 모드 추가
-
-def render_editor():
-    st.subheader("✏️ Step 3. 초안 작성 및 다듬기")
-
-    col1, col2 = st.columns([2, 1])
-
-    with col1:
-        st.toggle("Enter로 전송(채팅 입력 모드)", key="use_chat_mode", value=st.session_state.get("use_chat_mode", True), help="켜면 Enter로 전송되고, 줄바꿈은 Shift+Enter입니다. 끄면 기존 텍스트 영역에서 편집합니다.")
-
-        if st.session_state["use_chat_mode"]:
-            # 읽기 전용 초안 뷰 + 채팅 입력
-            st.text_area("현재 초안 (읽기 전용)", value=st.session_state["draft"], key="draft_view", height=300, disabled=True)
-
-            # chat_input은 Enter로 전송, Shift+Enter로 줄바꿈
-            new_line = st.chat_input("여기에 입력하고 Enter를 눌러 추가 (Shift+Enter 줄바꿈)")
-            if new_line is not None and new_line.strip() != "":
-                if st.session_state["draft"].strip():
-                    st.session_state["draft"] += "\n" + new_line
-                else:
-                    st.session_state["draft"] = new_line
-                log_event("draft_appended", {"source": "chat_input", "chars": len(new_line)})
-                st.rerun()
-        else:
-            # 기존 방식: 자유롭게 편집 가능한 텍스트 영역
-            st.text_area(
-                "내가 쓰고 있는 독서감상문",
-                key="draft",
-                height=300,
-                placeholder="위에서 AI 제안을 선택하거나 직접 작성해보세요.\n\n💡 팁: AI 제안은 시작점일 뿐이에요. 여러분의 생각과 경험을 더해서 자신만의 독서감상문을 만들어보세요!",
-            )
-
-    with col2:
-        render_quality_panel()
-
-    st.subheader("💾 Step 4. 완성된 글 저장하기")
-
-    if st.session_state["draft"].strip():
-        word_count = len(st.session_state["draft"])  # 단순 글자 수
-        st.info(f"현재 글자 수: {word_count}자")
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button(
-                "📄 텍스트 파일로 저장",
-                data=st.session_state["draft"],
-                file_name=f"{st.session_state['book_title']}_독서감상문.txt" if st.session_state["book_title"] else "독서감상문.txt",
-            )
-        with c2:
-            if st.button("🎉 작성 완료!"):
-                log_event("writing_completed", {"word_count": word_count, "book": st.session_state["book_title"]})
-                st.balloons()
-                st.success("독서감상문 작성을 완료했습니다! 수고하셨어요!")
-    else:
-        st.warning("아직 작성된 내용이 없습니다. 위에서 AI 제안을 선택하거나 직접 작성해보세요.")
-
-
-# ---------------------------
-# 4) 메인 함수
-# ---------------------------
-
-def main():
-    st.set_page_config(
-        page_title="AI 독서감상문 작문 도우미",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-    init_state()
-    render_sidebar()
-
-    st.title("📚 AI와 함께 쓰는 독서감상문")
-    st.caption("🤖 AI 제안 → 🤔 선택/수정 → ✨ 완성! AI 선생님과 함께 특별한 독서감상문을 만들어보세요.")
-
-    # 진행 상황 표시
-    steps_completed = [
-        bool(st.session_state["book_text"].strip()),
-        any(st.session_state["outline"].values()),
-        bool(st.session_state["draft"].strip()),
-    ]
-    progress = sum(steps_completed) / 3
-    st.progress(progress)
-    st.caption(f"진행 상황: {int(progress * 100)}% 완료")
-
-    render_outline()
-
-    st.divider()
-    st.markdown("## 🎯 AI와 함께하는 단계별 작문")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        render_suggestion_block("서론", "intro", "🌟")
-    with c2:
-        render_suggestion_block("본론", "body", "💭")
-    with c3:
-        render_suggestion_block("결론", "concl", "🎭")
-
-    st.divider()
-    render_editor()
-
-
-if __name__ == "__main__":
-    main()

@@ -49,7 +49,7 @@ def init_state():
         "book_index_json": {},           # 파싱된 요약/장면/키워드
         "focus_kw": "",                  # 선택된 키워드
         "saved_versions": [],
-        "model_name": "gpt-5",           # 기본 모델명
+        "model_name": "gpt-4o",           # 기본 모델명
         "spelling_feedback": [],         # 맞춤법/표현 피드백 보존
         "question_history": [],          # 중복 질문 방지 히스토리
         "question_nonce": 0              # 다양화 토큰
@@ -57,6 +57,27 @@ def init_state():
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+# --- Draft 안전 추가용 헬퍼 (충돌 방지) ---
+def _apply_draft_queue():
+    """이번 런 시작 전에 큐에 쌓인 추가 문장을 draft에 합친다."""
+    queued = st.session_state.pop("_draft_append_queue", [])
+    if queued:
+        cur = st.session_state.get("draft", "")
+        for part in queued:
+            if not part:
+                continue
+            cur = (cur + ("\n\n" if cur.strip() else "") + part).strip()
+        st.session_state["draft"] = cur
+
+def _queue_append(text: str):
+    """바로 session_state['draft']를 건드리지 말고 큐에 넣은 뒤 rerun."""
+    if not text:
+        return
+    q = st.session_state.get("_draft_append_queue", [])
+    q.append(text)
+    st.session_state["_draft_append_queue"] = q
+    st.rerun()
 
 # =========================
 # 1) OpenAI 래퍼
@@ -242,6 +263,7 @@ def generate_guiding_questions(context):
         "너는 초등학생이 이해하기 쉬운 열린 질문을 만드는 한국어 교사야. "
         "반드시 서로 다른 질문 시작어를 사용하고(왜/어떻게/만약), 각 질문은 1줄, 물음표(?)로 끝나야 해. "
         "이미 했던 질문들과 표현/의미가 겹치지 않게 만들어."
+        "아이들이 글을 쓰다 질문을 하면 너는 뒤를 이을 수 있는 책과 관련된 문장들을 세 가지 이상 추천해줘야 해"
     )
 
     user = f"""
@@ -629,60 +651,13 @@ def render_suggestion_block(label, key_block, icon):
                 with c1:
                     if st.button("✅ 수정 본문에 추가", key=f"accept_edit_{key_block}_{i}"):
                         text_to_add = (edited or sug).strip()
-                        cur = st.session_state["draft"].strip()
-                        st.session_state["draft"] = (cur + "\n\n" + text_to_add) if cur else text_to_add
-                        st.session_state["use_chat_mode"] = False  # 바로 편집 모드로 전환
-                        log_event("ai_suggestion_accepted", {"block": key_block, "text": text_to_add, "edited": edited != sug})
-                        st.success("본문에 추가했어요!")
-                        time.sleep(0.3)
-                        st.rerun()
+                        st.session_state["use_chat_mode"] = False
+                        _queue_append(text_to_add)  # ✅ 큐 사용
                 with c2:
                     if st.button("❌ 패스", key=f"reject_{key_block}_{i}"):
                         log_event("ai_suggestion_rejected", {"block": key_block, "text": sug})
                         st.info("다른 제안을 확인해보세요!")
 
-def build_draft_from_outline():
-    """outline + 책 인덱스(+키워드)로 1인칭 초안 생성"""
-    outline = st.session_state.get("outline", {})
-    book_index_raw = st.session_state.get("book_index", "")
-    focus_kw = st.session_state.get("focus_kw", "")
-
-    sys = ("너는 초등학생을 돕는 한국어 글쓰기 교사다. "
-           "학생이 쓴 개요를 바탕으로 1인칭 시점의 독서감상문 초안을 작성하라. "
-           "쉬운 표현을 사용하고 문장을 너무 길게 만들지 말라.")
-
-    user = f"""
-[개요]
-- 서론: {outline.get('intro','(비어 있음)')}
-- 본론: {outline.get('body','(비어 있음)')}
-- 결론: {outline.get('concl','(비어 있음)')}
-
-[책 지식(요약/장면/키워드)]
-{book_index_raw[:1200] or '(없음)'}
-
-[요청]
-- 1인칭("나는/내가")로 6~10문장
-- 서론→본론→결론 흐름을 살릴 것
-- 선택된 키워드가 있다면 자연스럽게 반영: {focus_kw or '(없음)'}
-- 지나친 장문/어려운 어휘 금지
-- 맺음말에 내가 배운 점/변화 다짐 한 문장 포함
-"""
-    resp = call_openai_api(
-        [{"role": "system", "content": sys}, {"role": "user", "content": user}],
-        max_tokens=700
-    )
-    if resp:
-        return resp.strip()
-
-    # 폴백: 개요를 이어붙임
-    intro = outline.get('intro', '').strip()
-    body  = outline.get('body', '').strip()
-    concl = outline.get('concl', '').strip()
-    pieces = []
-    if intro: pieces.append(intro)
-    if body:  pieces.append(body)
-    if concl: pieces.append(concl)
-    return "\n\n".join(pieces)
 
 def render_outline():
     # ===== Step 1. 책 내용 학습(요약/장면/키워드) =====
@@ -779,15 +754,6 @@ def render_outline():
     st.session_state["outline"]["body"]  = st.session_state.get("outline_body", "")
     st.session_state["outline"]["concl"] = st.session_state.get("outline_concl", "")
 
-    # 개요로 초안 만들기
-    if st.button("🧩 개요로 초안 만들기"):
-        with st.spinner("개요를 바탕으로 초안을 만드는 중..."):
-            draft = build_draft_from_outline()
-        if draft and draft.strip():
-            st.session_state["draft"] = draft.strip()
-            st.success("초안을 만들었어요! 아래 Step 3에서 계속 다듬어 보세요.")
-        else:
-            st.warning("초안 생성에 실패했어요. 개요를 좀 더 자세히 써 보거나 다시 시도해 주세요.")
 
 def render_snapshot_bar():
     c1, c2 = st.columns([1, 2])
@@ -825,16 +791,15 @@ def render_editor():
         if st.session_state["use_chat_mode"]:
             st.text_area("현재 초안 (읽기 전용)", value=st.session_state["draft"], key="draft_view", height=280, disabled=True)
             new_line = st.chat_input("여기에 입력하고 Enter를 눌러 추가 (Shift+Enter 줄바꿈)")
-            if new_line is not None and new_line.strip() != "":
-                st.session_state["draft"] = (st.session_state["draft"] + "\n" + new_line) if st.session_state["draft"].strip() else new_line
+            if new_line and new_line.strip():
                 log_event("draft_appended", {"source": "chat_input", "chars": len(new_line)})
-                st.rerun()
+                _queue_append(new_line)
         else:
             st.text_area(
                 "내가 쓰고 있는 독서감상문",
                 key="draft",
                 height=280,
-                placeholder="위에서 만든 개요를 바탕으로 초안을 만들거나, 직접 자유롭게 작성하세요.\n\n💡 아래 탭의 자동 제안/다음 문장 추천을 눌러 글을 확장해도 좋아요!",
+                placeholder="개요를 참고해 직접 작성하거나, 아래 탭의 제안을 활용해 확장하세요.",
             )
 
         # 집중 키워드 선택
@@ -866,16 +831,12 @@ def render_editor():
                         c1, c2 = st.columns([1,1])
                         with c1:
                             if st.button("추가", key=f"auto_add_{i}"):
-                                cur = st.session_state["draft"].strip()
-                                st.session_state["draft"] = (cur + "\n\n" + sug) if cur else sug
-                                st.rerun()
+                                _queue_append(sug)
                         with c2:
                             edited = st.text_input("수정 후 추가", value=sug, key=f"auto_edit_{i}")
                             if st.button("수정본 추가", key=f"auto_edit_add_{i}"):
                                 txt = (edited or sug).strip()
-                                cur = st.session_state["draft"].strip()
-                                st.session_state["draft"] = (cur + "\n\n" + txt) if cur else txt
-                                st.rerun()
+                                _queue_append(txt)
 
         # 2) 블록별 제안(서론/본론/결론)
         with t2:
@@ -904,10 +865,7 @@ def render_editor():
                     st.write(f"• {s}")
                 with c2n:
                     if st.button("추가", key=f"next_add_{i}"):
-                        st.session_state["draft"] = (
-                            st.session_state["draft"] + ("\n" if st.session_state["draft"].strip() else "") + s
-                        ).strip()
-                        st.rerun()
+                        _queue_append(s)
 
     # ---------- 우측: 품질 패널(맞춤법/질문) ----------
     with col2:
@@ -945,6 +903,7 @@ def main():
         initial_sidebar_state="expanded",
     )
     init_state()
+    _apply_draft_queue()   # ✅ 큐 반영 (필수)
     render_sidebar()
 
     st.title("📚 AI와 함께 쓰는 독서감상문")

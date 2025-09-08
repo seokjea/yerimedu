@@ -10,6 +10,15 @@ from dotenv import load_dotenv
 # =========================
 load_dotenv()
 
+# 전역 시스템 프롬프트(문체 일관화)
+BASE_SYSTEM = (
+    "너는 초등 4~6학년을 돕는 한국어 글쓰기 코치다. "
+    "항상 쉬운 어휘와 짧은 문장을 우선한다. "
+    "서술형 문장은 평서형 '다'체(예: ~했다, ~다)로 통일한다. "
+    "단, '질문을 출력하라'는 요청에는 이 문체 규칙을 적용하지 말고 물음표로 끝내라. "
+    "과장·이모지·특수문자 장식은 사용하지 않는다."
+)
+
 @st.cache_resource
 def get_openai_client():
     api_key = os.getenv("OPENAI_API_KEY")
@@ -49,10 +58,18 @@ def init_state():
         "book_index_json": {},           # 파싱된 요약/장면/키워드
         "focus_kw": "",                  # 선택된 키워드
         "saved_versions": [],
-        "model_name": "gpt-4o",           # 기본 모델명
-        "spelling_feedback": [],         # 맞춤법/표현 피드백 보존
-        "question_history": [],          # 중복 질문 방지 히스토리
-        "question_nonce": 0              # 다양화 토큰
+        "model_name": "gpt-4o",          # UI 표기용(실사용: gpt-4o-mini)
+        "spelling_feedback": [],
+        "question_history": [],
+        "question_nonce": 0,
+        # 다양화/히스토리/단계 관련
+        "suggestion_nonce": 0,         # 제안 다양화 토큰
+        "next_nonce": 0,               # 다음문장 다양화 토큰
+        "suggestion_history": {"intro": [], "body": [], "concl": [], "next": []},
+        "stage_mode": "auto",          # auto | manual
+        "manual_stage": "body",
+        "last_stage": None,
+        "last_stage_hash": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -79,18 +96,50 @@ def _queue_append(text: str):
     st.session_state["_draft_append_queue"] = q
     st.rerun()
 
+def _hash_tail(s: str, k: int = 800) -> str:
+    tail = (s or "")[-k:]
+    return hashlib.md5(tail.encode("utf-8")).hexdigest()
+
+def _register_history(block: str, items: list, keep: int = 50):
+    """이전 제안을 히스토리에 누적(중복 제거, 길이 제한)."""
+    hist = st.session_state.get("suggestion_history", {})
+    arr = hist.get(block, [])
+    arr = (arr + items)
+    seen, out = set(), []
+    for s in arr:
+        s = (s or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= keep:
+            break
+    hist[block] = out
+    st.session_state["suggestion_history"] = hist
+
 # =========================
 # 1) OpenAI 래퍼
 # =========================
-def call_openai_api(messages, max_tokens=500, model=None):
-    """Chat Completions 호출 (모델 gpt-4o-mini로 고정, SDK 파라미터 호환)."""
+def call_openai_api(
+    messages,
+    max_tokens=500,
+    model=None,
+    temperature=0.8,
+    presence_penalty=0.6,
+    frequency_penalty=0.4
+):
+    """Chat Completions 호출 (모델 gpt-4o-mini로 고정, 전역 시스템 프롬프트 주입)."""
     use_model = "gpt-4o-mini"  # ✅ 고정
+    messages = [{"role": "system", "content": BASE_SYSTEM}] + messages
     try:
         # 일반 SDK 파라미터
         resp = client.chat.completions.create(
             model=use_model,
             messages=messages,
             max_tokens=max_tokens,
+            temperature=temperature,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
         )
         return resp.choices[0].message.content
     except TypeError:
@@ -100,6 +149,9 @@ def call_openai_api(messages, max_tokens=500, model=None):
                 model=use_model,
                 messages=messages,
                 max_completion_tokens=max_tokens,
+                temperature=temperature,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
             )
             return resp.choices[0].message.content
         except Exception as e2:
@@ -119,8 +171,8 @@ def index_book_text():
         st.warning("인덱싱할 책 내용이 없습니다.")
         return
 
-    prompt = f"""
-너는 초등학생 독서감상문 도우미다. 아래 책 내용을 읽고 JSON으로만 답하라.
+    user_prompt = f"""
+너는 초등학생 독서감상문 도우미다. 아래 책 내용을 읽고 **유효한 JSON으로만** 답하라.
 형식:
 {{
   "summary": ["문장1","문장2","문장3"],     // 3문장 요약
@@ -129,8 +181,15 @@ def index_book_text():
 }}
 원문(일부 또는 전체):
 {txt[:4000]}
-"""
-    res = call_openai_api([{"role": "user", "content": prompt}], max_tokens=600)
+""".strip()
+
+    # JSON-only 강제 시스템 추가
+    messages = [
+        {"role": "system", "content": "응답은 반드시 유효한 JSON만 출력한다. 설명/코드블록 금지."},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    res = call_openai_api(messages, max_tokens=600, temperature=0.2, presence_penalty=0.0, frequency_penalty=0.0)
     if not res:
         st.warning("책 인덱싱에 실패했습니다.")
         return
@@ -162,7 +221,10 @@ def _stable_cache_key(parts: list) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()
 
 def generate_ai_suggestions(context, block, n=3):
-    """AI를 활용한 작문 제안 생성 (서론/본론/결론)"""
+    """AI를 활용한 작문 제안 생성 (서론/본론/결론) — 다양화/히스토리/샘플링 강화."""
+    nonce = st.session_state.get("suggestion_nonce", 0)
+    history = st.session_state.get("suggestion_history", {}).get(block, [])[-15:]
+
     key_fields = [
         context.get("book_title", ""),
         context.get("book_text", "")[:800],
@@ -171,7 +233,8 @@ def generate_ai_suggestions(context, block, n=3):
         block,
         n,
         st.session_state.get("focus_kw", ""),
-        st.session_state.get("book_index", "")[:1200]
+        st.session_state.get("book_index", "")[:1200],
+        nonce,  # 다양화 토큰 포함
     ]
     cache_key = _stable_cache_key(key_fields)
     cache = st.session_state["ai_suggestions_cache"]
@@ -187,7 +250,7 @@ def generate_ai_suggestions(context, block, n=3):
     book_index = st.session_state.get("book_index", "")
 
     prompt = f"""
-당신은 초등학교 4-6학년 학생의 독서감상문 작성을 돕는 AI 교사입니다.
+당신은 초등학교 4-6학년 학생의 독서감상문 작성을 돕는 AI 교사다.
 학생 정보:
 - 책 제목: {context.get('book_title', '미정')}
 - 책 내용(요약/장면/키워드): {book_index[:1200] or '(없음)'}
@@ -195,34 +258,58 @@ def generate_ai_suggestions(context, block, n=3):
 - 현재 초안(마지막 500자): {context.get('draft', '')[-500:] or '(없음)'}
 - 선택된 키워드: {focus_kw or '(없음)'}
 
-요청: {block_prompts[block]} 문장 제안을 {n}개 만들어주세요.
+요청: {block_prompts[block]} 문장 제안을 {n}개 만들어라.
 
 조건:
 1) 초등학생 수준의 쉽고 자연스러운 표현
-2) 각 제안은 한 문장으로 완성
+2) 각 제안은 한 문장으로 완성, 말끝은 '다'로 통일
 3) 구체적이고 실용적인 내용
 4) 학생이 선택·수정하여 바로 사용할 수 있는 형태
-5) 1인칭 시점("나는", "내가")
-6) 번호나 특수문자 없이 문장만 제시
+5) 1인칭 시점('나는', '내가')
+6) 번호·불릿·특수문자 없이 문장만 제시
+7) 아래 이전 제안들과 같은 의미나 구절을 반복하지 말 것
+
+[이전에 나온 제안(중복 금지)]
+{chr(10).join('• '+x for x in history) if history else '(없음)'}
+
+[다양화토큰]
+{nonce}
 
 예시: 이 책을 읽게 된 이유는 표지가 예뻐서 호기심이 생겼기 때문이다.
 
 제안 {n}개:
-"""
+""".strip()
     with st.spinner("🤖 AI가 제안을 만들고 있어요..."):
-        response = call_openai_api([{"role": "user", "content": prompt}], max_tokens=400)
+        response = call_openai_api(
+            [{"role": "user", "content": prompt}],
+            max_tokens=400, temperature=0.9, presence_penalty=0.6, frequency_penalty=0.4
+        )
+    lines = []
     if response:
         lines = []
         for line in response.strip().split("\n"):
-            s = line.strip().lstrip("0123456789.- ").strip()
+            s = line.strip().lstrip("0123456789.-•* ").strip()
             if s and len(s) > 8:
                 lines.append(s)
-        lines = lines[:n]
-        cache[cache_key] = lines
-        log_event("ai_suggestions_generated", {"block": block, "count": len(lines)})
-        return lines
 
-    return get_fallback_suggestions(block, n)
+    # 후처리: 과거/이번 결과 중복 제거
+    seen = set(history)
+    cleaned = []
+    for s in lines:
+        if s in seen:
+            continue
+        seen.add(s)
+        cleaned.append(s)
+        if len(cleaned) == n:
+            break
+
+    if not cleaned:
+        cleaned = get_fallback_suggestions(block, n)
+
+    cache[cache_key] = cleaned
+    _register_history(block, cleaned)  # 히스토리 누적
+    log_event("ai_suggestions_generated", {"block": block, "count": len(cleaned)})
+    return cleaned
 
 def get_fallback_suggestions(block, n=3):
     fallback = {
@@ -260,9 +347,9 @@ def generate_guiding_questions(context):
     draft_tail = (context.get("draft", "") or "")[-200:]
 
     system = (
-        "너는 초등학생이 이해하기 쉬운 열린 질문을 만드는 한국어 교사야. "
-        "반드시 서로 다른 질문 시작어를 사용하고(왜/어떻게/만약), 각 질문은 1줄, 물음표(?)로 끝나야 해. "
-        "이미 했던 질문들과 표현/의미가 겹치지 않게 만들어."
+        "너는 초등학생이 이해하기 쉬운 열린 질문을 만드는 한국어 교사다. "
+        "반드시 서로 다른 질문 시작어를 사용하고(왜/어떻게/만약), 각 질문은 1줄, 물음표(?)로 끝내라. "
+        "이미 했던 질문들과 표현/의미가 겹치지 않게 만들어라."
         "아이들이 글을 쓰다 질문을 하면 너는 뒤를 이을 수 있는 책과 관련된 문장들을 세 가지 이상 추천해줘야 해"
     )
 
@@ -284,11 +371,11 @@ def generate_guiding_questions(context):
 - 다양화토큰: {nonce}
 
 질문 3개:
-"""
+""".strip()
 
     resp = call_openai_api(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        max_tokens=300
+        max_tokens=300, temperature=0.7, presence_penalty=0.3, frequency_penalty=0.3
     )
     if not resp:
         base = [
@@ -345,7 +432,7 @@ def check_spelling_and_grammar(text):
     resp = call_openai_api(
         [{"role": "system", "content": system},
          {"role": "user", "content": user}],
-        max_tokens=300
+        max_tokens=300, temperature=0.0, presence_penalty=0.0, frequency_penalty=0.0
     ) or ""
 
     lines = [ln.strip() for ln in resp.splitlines() if ln.strip()]
@@ -362,7 +449,7 @@ def check_spelling_and_grammar(text):
         style = call_openai_api(
             [{"role": "system", "content": style_sys},
              {"role": "user", "content": style_user}],
-            max_tokens=160
+            max_tokens=160, temperature=0.2, presence_penalty=0.0, frequency_penalty=0.0
         ) or ""
         tips = []
         for ln in style.splitlines():
@@ -396,13 +483,13 @@ def detect_stage(draft: str, outline: dict) -> str:
 def detect_stage_llm(draft, outline):
     """LLM 기반 단계 감지 (intro/body/concl 중 하나만)"""
     prompt = f"""
-학생 초안을 보고 현재 어느 단계인지 intro/body/concl 중 하나로만 답해줘. 다른 말은 하지 마.
+학생 초안을 보고 현재 어느 단계인지 intro/body/concl 중 하나로만 답해라. 다른 말은 하지 마라.
 초안(마지막 800자):
 {(draft or '')[-800:]}
 개요:
 {json.dumps(outline or {}, ensure_ascii=False)}
-"""
-    resp = call_openai_api([{"role": "user", "content": prompt}], max_tokens=8) or ""
+""".strip()
+    resp = call_openai_api([{"role": "user", "content": prompt}], max_tokens=8, temperature=0.0, presence_penalty=0.0, frequency_penalty=0.0) or ""
     r = resp.lower()
     if "intro" in r:
         return "intro"
@@ -414,20 +501,23 @@ def suggest_next_sentences(context, n=3):
     """현재 초안의 끝을 자연스럽게 잇는 '한 문장' 제안 n개.
     - LLM 응답이 비어도 폴백으로 항상 n개 채움
     - 책 요약/장면/키워드와 focus_kw를 가볍게 반영
+    - 다양화/히스토리/샘플링 강화
     """
     draft_tail = (context.get("draft", "") or "")[-500:]
     book_index_raw = st.session_state.get("book_index", "") or ""
     idx = st.session_state.get("book_index_json", {}) or {}
     focus_kw = st.session_state.get("focus_kw", "")
+    nonce = st.session_state.get("next_nonce", 0)
+    history = st.session_state.get("suggestion_history", {}).get("next", [])[-15:]
 
     # 1) LLM 요청
     prompt = f"""
-학생 초안의 마지막 부분을 자연스럽게 이어갈 **한 문장** 제안을 {n}개 만들어줘.
+학생 초안의 마지막 부분을 자연스럽게 이어갈 **한 문장** 제안을 {n}개 만들어라.
 조건:
 - 초등학생이 이해하기 쉬운 표현
-- 각 제안은 한 문장만 (마침표로 끝내기)
+- 각 제안은 한 문장만 (마침표로 끝내기), 말끝은 '다'로 통일
 - 너무 길지 않게 (30자~70자 권장)
-- 같은 의미/표현 중복 금지
+- 같은 의미/표현 중복 금지(아래 이전 제안 반복 금지)
 
 [지금까지 초안(마지막 500자)]
 {draft_tail or '(없음)'}
@@ -437,18 +527,24 @@ def suggest_next_sentences(context, n=3):
 
 [선택된 키워드]
 {focus_kw or '(없음)'}
-"""
-    resp = call_openai_api([{"role": "user", "content": prompt}], max_tokens=300) or ""
+
+[이전에 나온 다음문장(중복 금지)]
+{chr(10).join('• '+x for x in history) if history else '(없음)'}
+
+[다양화토큰]
+{nonce}
+""".strip()
+    resp = call_openai_api(
+        [{"role": "user", "content": prompt}],
+        max_tokens=300, temperature=0.9, presence_penalty=0.6, frequency_penalty=0.4
+    ) or ""
 
     # 2) 1차 후보 정리
     cand_lines = [ln.strip() for ln in resp.splitlines() if ln.strip()]
-    cleaned, seen = [], set()
+    cleaned, seen = [], set(history)
     for ln in cand_lines:
-        s = ln.lstrip("0123456789.-•* ").strip()
-        s = s.replace("  ", " ").rstrip()
-        if not s:
-            continue
-        if s in seen:
+        s = ln.lstrip("0123456789.-•* ").strip().replace("  ", " ").rstrip()
+        if not s or s in seen:
             continue
         seen.add(s)
         cleaned.append(s)
@@ -484,6 +580,7 @@ def suggest_next_sentences(context, n=3):
                 cleaned.append(fb)
                 seen.add(fb)
 
+    _register_history("next", cleaned)
     return cleaned[:n]
 
 # =========================
@@ -529,8 +626,7 @@ def _book_text_from_info(info: dict) -> str:
 def render_sidebar():
     st.sidebar.header("⚙️ 설정")
 
-    # 모델명 변경 가능 (기본 gpt-5)
-    # 모델 고정: gpt-4o-mini (UI 숨김)
+    # 모델 고정: gpt-4o-mini (UI에는 상태만 표시)
     api_status = "🟢 연결됨" if os.getenv("OPENAI_API_KEY") else "🔴 미연결"
     st.sidebar.caption(f"AI 상태: {api_status} · 사용 모델: gpt-4o-mini(고정)")
 
@@ -717,8 +813,8 @@ def render_outline():
 
     st.divider()
 
-    # ===== Step 2. 글의 뼈대 및 초안 만들기 =====
-    st.subheader("📝 Step 2. 글의 뼈대 및 초안 만들기")
+    # ===== Step 2. 글의 뼈대 만들기(학생이 직접 작성) =====
+    st.subheader("📝 Step 2. 글의 뼈대 만들기")
 
     cols = st.columns(3)
     with cols[0]:
@@ -811,10 +907,43 @@ def render_editor():
 
         # 1) 현재 단계 자동 제안
         with t1:
-            st.caption("초안과 개요를 보고 지금 단계(intro/body/concl)를 추정해 그에 맞는 문장 제안을 생성합니다.")
+            st.caption("초안과 개요를 보고 지금 단계(intro/body/concl)를 추정해 그에 맞는 문장 제안을 생성한다.")
+
+            # 단계 선택 (자동/수동) + 스티키 감지
+            colm = st.columns([1, 2, 2])
+            with colm[0]:
+                st.session_state["stage_mode"] = st.radio(
+                    "단계 모드", ["auto", "manual"], horizontal=True, label_visibility="collapsed",
+                    index=0 if st.session_state.get("stage_mode","auto")=="auto" else 1
+                )
+            with colm[1]:
+                st.session_state["manual_stage"] = st.selectbox(
+                    "수동 단계 선택", ["intro", "body", "concl"], index=["intro","body","concl"].index(
+                        st.session_state.get("manual_stage","body")
+                    )
+                )
+            with colm[2]:
+                st.write(" ")
+
             if st.button("🔄 새 제안 받기", key="auto_stage_refresh"):
-                stage = detect_stage_llm(st.session_state["draft"], st.session_state["outline"])
+                cur_hash = _hash_tail(st.session_state["draft"])
+                prev_hash = st.session_state.get("last_stage_hash")
+                prev_stage = st.session_state.get("last_stage")
+
+                if st.session_state["stage_mode"] == "manual":
+                    stage = st.session_state["manual_stage"]
+                else:
+                    if prev_hash == cur_hash and prev_stage:
+                        stage = prev_stage
+                    else:
+                        stage = detect_stage_llm(st.session_state["draft"], st.session_state["outline"])
+
                 st.session_state["last_stage"] = stage
+                st.session_state["last_stage_hash"] = cur_hash
+
+                # 다양화 토큰 증가
+                st.session_state["suggestion_nonce"] += 1
+
                 ctx = {
                     "book_title": st.session_state["book_title"],
                     "book_text": st.session_state["book_text"],
@@ -822,7 +951,8 @@ def render_editor():
                     "draft": st.session_state["draft"],
                 }
                 st.session_state["auto_stage_suggestions"] = generate_ai_suggestions(ctx, stage, st.session_state["n_sugs"])
-                st.success(f"현재 단계 추정: {stage}")
+                badge = "자동" if st.session_state["stage_mode"]=="auto" else "고정"
+                st.success(f"현재 단계: {stage} ({badge})")
 
             if st.session_state.get("auto_stage_suggestions"):
                 for i, sug in enumerate(st.session_state["auto_stage_suggestions"]):
@@ -850,8 +980,9 @@ def render_editor():
 
         # 3) 다음 문장 추천
         with t3:
-            st.caption("현재 초안의 마지막 부분을 자연스럽게 잇는 한 문장을 추천합니다.")
+            st.caption("현재 초안의 마지막 부분을 자연스럽게 잇는 한 문장을 추천한다.")
             if st.button("➡ 다음 문장 3개", key="next_sent_refresh"):
+                st.session_state["next_nonce"] += 1   # 다양화 토큰
                 ctx = {
                     "book_title": st.session_state["book_title"],
                     "draft": st.session_state["draft"],
@@ -903,7 +1034,7 @@ def main():
         initial_sidebar_state="expanded",
     )
     init_state()
-    _apply_draft_queue()   # ✅ 큐 반영 (필수)
+    _apply_draft_queue()   # ✅ 큐 반영 (필수) — rerun 사이 안전 추가
     render_sidebar()
 
     st.title("📚 AI와 함께 쓰는 독서감상문")
